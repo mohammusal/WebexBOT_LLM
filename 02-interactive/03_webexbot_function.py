@@ -34,55 +34,50 @@ class AutoProvisioning(Command):
         :return: a string or Response object (or a list of either). Use Response if you want to return another card.
         """
         card = {
-            "contentType": "application/vnd.microsoft.card.adaptive",
-            "content": {
-                "type": "AdaptiveCard",
-                "body": [
-                    {
-                        "type": "ColumnSet",
-                        "columns": [
-                            {
-                                "type": "Column",
-                                "items": [
-                                    {
-                                        "type": "TextBlock",
-                                        "weight": "Bolder",
-                                        "text": "Welcome to the Auto-Provisioning Bot!\n",
-                                        "horizontalAlignment": "Left",
-                                        "wrap": True,
-                                        "color": "Light",
-                                        "size": "Large",
-                                        "spacing": "Small"
-                                    }
-                                ],
-                                "width": "stretch"
-                            }
-                        ]
-                    },
-                    {
-                        "type": "TextBlock",
-                        "text": "Please, insert the MAC address of your new phone:",
-                        "wrap": True
-                    },
-                    {
-                        "type": "Input.Text",
-                        "placeholder": "MAC Address",
-                        "id": "mac_address"
-                    }
-                ],
-                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                "version": "1.3",
-                "actions": [
-                    {
-                        "type": "Action.Submit",
-                        "title": "Submit",
-                        "data": {
-                            "callback_keyword": "provision_callback"
+    "type": "AdaptiveCard",
+    "body": [
+        {
+            "type": "ColumnSet",
+            "columns": [
+                {
+                    "type": "Column",
+                    "items": [
+                        {
+                            "type": "Image",
+                            "style": "Person",
+                            "url": "https://developer.webex.com/images/webex-logo-icon-non-contained.svg",
+                            "size": "Medium",
+                            "height": "50px"
                         }
-                    }
-                ]
-            }
+                    ],
+                    "width": "auto"
+                }
+            ]
+        },
+        {
+            "type": "TextBlock",
+            "text": "This is my First Designed Card",
+            "wrap": True,
+            "id": "Hello"
+        },
+        {
+            "type": "ActionSet",
+            "spacing": "Small",
+            "horizontalAlignment": "Right",
+            "$when": "Submit",
+            "id": "Submit",
+            "$data": "Submit",
+            "actions": [
+                {
+                    "type": "Action.Submit",
+                    "title": "Action.Submit"
+                }
+            ]
         }
+    ],
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "version": "1.3"
+}
 
         response = Response()
         response.text = "Text is needed when sending a card."
