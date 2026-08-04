@@ -56,6 +56,7 @@ class MCPBridge:
         self._session: ClientSession | None = None
         self._openai_tools: list[dict[str, Any]] = []
         self._ready = threading.Event()
+        self._startup_error: Exception | None = None
         self._openai = OpenAI()
         self._lock = asyncio.Lock()
 
@@ -69,6 +70,10 @@ class MCPBridge:
         self._thread.start()
         if not self._ready.wait(timeout=30):
             raise RuntimeError("MCPBridge failed to start within 30 seconds")
+        if self._session is None:
+            raise RuntimeError(
+                f"MCPBridge: server failed to connect — {self._startup_error}"
+            )
         log.info("MCPBridge ready — %d tools discovered", len(self._openai_tools))
 
     def shutdown(self) -> None:
@@ -103,7 +108,10 @@ class MCPBridge:
         except asyncio.CancelledError:
             pass
         except Exception as exc:
+            import sys
+            print(f"\n❌ MCP BRIDGE ERROR: {exc}\n", file=sys.stderr)
             log.error("MCP session error: %s", exc)
+            self._startup_error = exc
             self._ready.set()
 
     # ------------------------------------------------------------------
