@@ -56,7 +56,8 @@ class MCPBridge:
         self._session: ClientSession | None = None
         self._openai_tools: list[dict[str, Any]] = []
         self._ready = threading.Event()
-        self._startup_error: Exception | None = None
+        self._startup_error: BaseException | None = None
+        self._startup_ok: bool = False
         self._openai = OpenAI()
         self._lock = asyncio.Lock()
 
@@ -70,9 +71,12 @@ class MCPBridge:
         self._thread.start()
         if not self._ready.wait(timeout=30):
             raise RuntimeError("MCPBridge failed to start within 30 seconds")
-        if self._session is None:
+        if not self._startup_ok or self._session is None:
+            cause = self._startup_error
             raise RuntimeError(
-                f"MCPBridge: server failed to connect — {self._startup_error}"
+                f"MCPBridge: server failed to start — "
+                f"{type(cause).__name__}: {cause}" if cause is not None
+                else "MCPBridge: server failed to start for an unknown reason"
             )
         log.info("MCPBridge ready — %d tools discovered", len(self._openai_tools))
 
@@ -101,17 +105,27 @@ class MCPBridge:
                     tools_result = await session.list_tools()
                     self._openai_tools = self._translate_tools(tools_result.tools)
 
+                    self._startup_ok = True
                     self._ready.set()
                     # Keep the loop alive until stopped
                     while True:
                         await asyncio.sleep(1)
         except asyncio.CancelledError:
             pass
-        except Exception as exc:
+        except BaseException as exc:
             import sys
-            print(f"\n❌ MCP BRIDGE ERROR: {exc}\n", file=sys.stderr)
-            log.error("MCP session error: %s", exc)
-            self._startup_error = exc
+            # Unwrap ExceptionGroup / BaseExceptionGroup to show the real cause
+            real_exc = exc
+            if isinstance(exc, BaseExceptionGroup):
+                while isinstance(real_exc, BaseExceptionGroup) and real_exc.exceptions:
+                    real_exc = real_exc.exceptions[0]
+            print(f"\n❌ MCP BRIDGE ERROR: {type(real_exc).__name__}: {real_exc}\n", file=sys.stderr)
+            log.error("MCP session error: %s: %s", type(real_exc).__name__, real_exc)
+            # Mark startup as failed and drop the (now closed/unusable) session
+            # reference so callers cannot mistake a dead session for a live one.
+            self._startup_error = real_exc
+            self._startup_ok = False
+            self._session = None
             self._ready.set()
 
     # ------------------------------------------------------------------
@@ -119,19 +133,62 @@ class MCPBridge:
     # ------------------------------------------------------------------
 
     def _translate_tools(self, mcp_tools: list) -> list[dict[str, Any]]:
-        """Convert MCP tool schemas to OpenAI function-calling specs."""
+        """Convert MCP tool schemas to OpenAI function-calling specs.
+
+        Schema extraction is resilient to differences in the MCP SDK's tool
+        object shape (e.g. ``inputSchema`` vs ``input_schema`` across versions):
+        a single malformed or unexpectedly-shaped tool is skipped rather than
+        aborting discovery of the whole tool set.
+        """
         openai_tools = []
         for tool in mcp_tools:
-            spec = {
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "parameters": tool.inputSchema if tool.inputSchema else {"type": "object", "properties": {}},
-                },
-            }
-            openai_tools.append(spec)
+            try:
+                name = getattr(tool, "name", None)
+                if not name:
+                    log.warning("Skipping MCP tool with no name: %r", tool)
+                    continue
+                schema = self._extract_tool_schema(tool, name)
+                spec = {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": getattr(tool, "description", None) or "",
+                        "parameters": schema,
+                    },
+                }
+                openai_tools.append(spec)
+            except Exception as exc:
+                log.warning(
+                    "Skipping MCP tool '%s' — could not translate schema: %s: %s",
+                    getattr(tool, "name", "?"), type(exc).__name__, exc,
+                )
         return openai_tools
+
+    @staticmethod
+    def _extract_tool_schema(tool: Any, name: str) -> dict[str, Any]:
+        """Defensively extract a tool's JSON input schema across SDK shapes."""
+        empty_schema = {"type": "object", "properties": {}}
+        # Fallback chain: attribute (camelCase) → attribute (snake_case) →
+        # serialized model dump → empty object schema.
+        schema = getattr(tool, "inputSchema", None)
+        if schema is None:
+            schema = getattr(tool, "input_schema", None)
+        if schema is None:
+            dump = getattr(tool, "model_dump", None)
+            if callable(dump):
+                try:
+                    dumped = dump(by_alias=True)
+                except TypeError:
+                    dumped = dump()
+                if isinstance(dumped, dict):
+                    schema = dumped.get("inputSchema") or dumped.get("input_schema")
+        if not isinstance(schema, dict) or not schema:
+            log.warning(
+                "MCP tool '%s' exposed no usable input schema; "
+                "falling back to an empty object schema.", name,
+            )
+            return empty_schema
+        return schema
 
     def get_openai_tools(self) -> list[dict[str, Any]]:
         """Return cached OpenAI tool specs (call after start())."""
@@ -141,9 +198,22 @@ class MCPBridge:
     # Agentic Tool-Calling Loop
     # ------------------------------------------------------------------
 
+    def _is_live(self) -> bool:
+        """True only when the background loop is running and the session is usable.
+
+        Guards synchronous callers against scheduling work onto a dead loop
+        (which would otherwise block until the call timeout).
+        """
+        return bool(
+            self._startup_ok
+            and self._session is not None
+            and self._loop is not None
+            and self._loop.is_running()
+        )
+
     def run(self, messages: list[dict[str, Any]], timeout: float = CALL_TIMEOUT_SECONDS) -> str:
         """Synchronous entry point: run the agentic loop and return final text."""
-        if not self._loop or not self._session:
+        if not self._is_live():
             return "⚠️ MCP Bridge is not connected. Please try again later."
         future = asyncio.run_coroutine_threadsafe(
             self._agentic_loop(messages), self._loop
@@ -218,7 +288,7 @@ class MCPBridge:
 
     def list_resources_sync(self) -> list[dict[str, str]]:
         """List available MCP resources (synchronous)."""
-        if not self._loop or not self._session:
+        if not self._is_live():
             return []
         future = asyncio.run_coroutine_threadsafe(
             self._list_resources(), self._loop
@@ -237,12 +307,16 @@ class MCPBridge:
                 for r in result.resources
             ]
         except Exception as exc:
-            log.warning("list_resources failed: %s", exc)
+            log.warning(
+                "MCP list_resources failed (%s: %s) — returning empty; this is a "
+                "DEGRADED state, not a server with zero resources.",
+                type(exc).__name__, exc,
+            )
             return []
 
     def read_resource_sync(self, uri: str) -> str:
         """Read a specific MCP resource by URI (synchronous)."""
-        if not self._loop or not self._session:
+        if not self._is_live():
             return ""
         future = asyncio.run_coroutine_threadsafe(
             self._read_resource(uri), self._loop
@@ -273,7 +347,7 @@ class MCPBridge:
 
     def list_prompts_sync(self) -> list[dict[str, Any]]:
         """List available MCP prompts (synchronous)."""
-        if not self._loop or not self._session:
+        if not self._is_live():
             return []
         future = asyncio.run_coroutine_threadsafe(
             self._list_prompts(), self._loop
@@ -299,12 +373,16 @@ class MCPBridge:
                 for p in result.prompts
             ]
         except Exception as exc:
-            log.warning("list_prompts failed: %s", exc)
+            log.warning(
+                "MCP list_prompts failed (%s: %s) — returning empty; this is a "
+                "DEGRADED state, not a server with zero prompts.",
+                type(exc).__name__, exc,
+            )
             return []
 
     def get_prompt_sync(self, name: str, arguments: dict[str, str] | None = None) -> str:
         """Retrieve a rendered MCP prompt by name (synchronous)."""
-        if not self._loop or not self._session:
+        if not self._is_live():
             return ""
         future = asyncio.run_coroutine_threadsafe(
             self._get_prompt(name, arguments or {}), self._loop
