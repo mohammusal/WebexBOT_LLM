@@ -269,7 +269,7 @@ class MCPBridge:
         """Dispatch a single tool call to the MCP server."""
         try:
             result = await self._session.call_tool(name, arguments)
-            if result.isError:
+            if result.is_error:
                 error_text = "\n".join(
                     block.text for block in result.content if hasattr(block, "text")
                 )
